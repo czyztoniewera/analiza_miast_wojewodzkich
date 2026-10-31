@@ -1,0 +1,360 @@
+---
+title: "Atrakcyjność osadnicza miast wojewódzkich w Polsce okiem studenta"
+author: "Weronika Czyż"
+date: "2026-10-28"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+---
+
+Poniższa analiza ma na celu zbadanie atrakcyjności osadniczej 18 miast wojewódzkich w Polsce z punktu widzenia studenta. Zastosowane poniżej metody porządkowania liniowego - wzorcowa metoda Hellwiga oraz bezwzorcowa metoda standaryzowanych sum, pozwolą stworzyć obiektywny ranking miast. Dopełnieniem badania jest analiza skupień (metoda k-średnich oraz metoda Warda), która umożliwia wyodręnienie grup miast o zbliżonych profilach.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, error = FALSE)
+#zaokraglenie wyników
+p <- function(x, d = 3) round(x, d)
+```
+
+# Dane i zmienne
+
+Analizą objęto 18 miast wojewódzkich, przyjmując za okres badawczy rok 2022. Zmienne pobrano bezpośrednio z Banku Danych Lokalnych GUS przy użyciu pakietu bdl. Zestaw danych obejmuje 7 wskaźników z zakresu finansów, infrastruktury i bezpieczeństwa.
+
+```{r}
+library(bdl)
+library(mice)
+
+rok <- 2022
+
+zmienne <- c(
+  wynagrodzenie = 64428,
+  mieszkania = 633166,
+  budzet = 76542,
+  imprezy = 58505,
+  sciezki = 288080,
+  bezrobocie = 60270,
+  przestepstwa = 58564,
+  ludnosc = 72305 #zmienna bazowa
+)
+
+plik_pobrany <- "dane_raw.rds"
+
+if(file.exists(plik_pobrany)) {
+  dane_raw <- readRDS(plik_pobrany)
+} else {
+  pobierz <- function(nazwa) {
+    Sys.sleep(0.6)
+    d <- get_data_by_variable(varId = zmienne[[nazwa]], unitLevel = 5, year = rok)
+    d <- as.data.frame(d)[, c("id", "name", "val")]
+    names(d)[3] <- nazwa
+    d
+  }
+  
+  dane_lista <- lapply(names(zmienne), pobierz)
+  dane_raw <- Reduce(function(x, y) merge(x, y, by = c("id", "name"), all = TRUE), dane_lista)
+
+  saveRDS(dane_raw, plik_pobrany)
+}
+
+miasta <- c("Powiat m. Wrocław", "Powiat m. Bydgoszcz", "Powiat m. Toruń", "Powiat m. Lublin", "Powiat m. Gorzów Wielkopolski", "Powiat m. Zielona Góra", "Powiat m. Łódź", "Powiat m. Kraków", "Powiat m. st. Warszawa", "Powiat m. Opole", "Powiat m. Rzeszów", "Powiat m. Białystok", "Powiat m. Gdańsk", "Powiat m. Katowice", "Powiat m. Kielce", "Powiat m. Olsztyn", "Powiat m. Poznań", "Powiat m. Szczecin")
+
+dane <- dane_raw[dane_raw$name %in% miasta, ]
+
+# sprawdzenie braków danych
+if (nrow(dane) != 18) {
+  cat("brakuje:", setdiff(miasta, dane$name), "\n")
+  stop("Nie podano wszystkich miast wojewódzkich")
+}
+
+wzorzec_brakow <- md.pattern(dane[, names(zmienne)], rotate.names = TRUE)
+```
+
+Dane pobrane z BDL są kompletne. Braki danych nie występują, a wszystkie miasta wojewódzkie zostały poprawnie zidentyfikowane. Zestaw jest gotowy do dalszej analizy.
+
+# Przekształcenia zmiennych
+
+Aby pozbyć się dysproporcji wynikających z różnic w wielkości populacji miast, zmienne X3 - wydatki budżetu miasta na transport, X4 - imprezy masowe, X5 - długość ścieżek rowerowych oraz X7- przestępstwa przeciwko mieniu zastępiono miarami natężenia. Przeliczenie tych wartości na wskaźniki natężenia (per capita, na 1000 lub 10 tysięcy mieszkańców) zapobiegło sztucznemu faworyzowaniu największych miast.
+
+```{r}
+# usunięcie "Powiat m." z nazwy miasta
+dd <- data.frame(
+  Miasto = sub("^Powiat m\\. (st\\. )?", "", dane$name),
+  X1 = dane$wynagrodzenie,                        # stymulanta
+  X2 = dane$mieszkania,                           # destymulanta
+  X3 = dane$budzet / dane$ludnosc,                # stymulanta
+  X4 = dane$imprezy / dane$ludnosc * 1000,        # stymulanta
+  X5 = dane$sciezki / dane$ludnosc * 10000,       # stymulanta
+  X6 = dane$bezrobocie,                           # destymulanta
+  X7 = dane$przestepstwa / dane$ludnosc * 1000    # destymulanta
+)
+rownames(dd) <- dd$Miasto
+x <- dd[, -1]
+
+opis_zm <- data.frame(
+  Symbol = paste0("X", 1:7),
+  Zmienna = c(
+    "Przeciętne miesięczne wynagrodzenie brutto (zł)",
+    "Średnia cena 1 m2 lokalu mieszkalnego na rynku wtórnym (zł)",
+    "Wydatki budżetu miasta na transport na 1 mieszkańca (zł)",
+    "Imprezy masowe zorganizowane na 1000 mieszkańców",
+    "Długość ścieżek rowerowych na 10 tys. mieszkańców",
+    "Stopa bezrobocia rejestrowanego (%)",
+    "Przestępstwa stwierdzone przeciwko mieniu na 1000 mieszkańców"),
+  Charakter = c("stymulanta", "destymulanta", "stymulanta", "stymulanta", "stymulanta", "destymulanta", "destymulanta"))
+
+knitr::kable(opis_zm)
+```
+
+Zmienna X2 jest ceną zakupu mieszkania na rynku wtórnym, a nie ceną najmu, i traktowana jest jako przybliżenie kosztów mieszkaniowych studenta.
+
+Poniżej znajduje się pełna, przygotowana pod dalszą analizę macierz 18 x 7. 
+
+```{r macierz}
+knitr::kable(round(x, 2), caption = "Dane wejściowe do analizy")
+```
+
+Już na tym etapie widać zróżnicowanie miast. Warszawa ma najwyższe przeciętne wynagrodzenie brutto i najwyższe ceny mieszkań, a Białystok najniższe wydatki na transport.
+
+# Eksploracyjna analiza danych
+
+```{r}
+opis <- data.frame(
+  srednia = sapply(x, mean),
+  mediana = sapply(x, median),
+  sd = sapply(x, sd),
+  min = sapply(x, min),
+  max = sapply(x, max)
+)
+opis$V <- opis$sd / opis$srednia * 100
+knitr::kable(round(opis, 2), caption = "Statystyki opisowe")
+
+# zmienne quasi-stałe
+qs <- rownames(opis)[opis$V < 10]
+if (length(qs) > 0) cat("Quasi-stałe (V < 10%):", qs, "\n") else cat("Brak zmiennych quasi-stałych\n")
+```
+
+Żadna zmienna nie jest quasi-stała (V < 10%), więc wszystkie siedem różnicuje miasta w stopniu pozwalającym na ich wykorzystanie. Najmniejsze zróżnicowanie ma X1 (V = 11,26%): przeciętne wynagrodzenie wynosi 6917 zł i waha się od 5891 zł do 8540 zł. Wartość jest tylko nieznacznie powyżej progu 10%, więc X1 różnicuje miasta najsłabiej.
+
+Bardzo wysoka zmienność X4 wynika z asymetrii rozkładu: średnia (6,69) jest wyraźnie wyższa od mediany (4,32), bo cztery miasta (Zielona Góra 23,5, Katowice 14,7, Lublin 14,4, Kraków 12,7) mają kilkukrotnie więcej imprez na 1000 mieszkańców niż pozostałe.
+
+
+# Obserwacje odstające
+
+```{r}
+ze <- scale(x)
+for (j in colnames(ze)) {
+  odst <- rownames(ze)[abs(ze[, j]) > 2]
+  if (length(odst) > 0) cat(j, "Odstaje:", odst, "\n")
+}
+```
+
+```{r}
+boxplot(ze, main = "Zmienne po standaryzacji (przed zamianą destymulant)", ylab = "z")
+abline(h = 0, lty = 2)
+```
+
+Według kryterium |z| > 2 odstają: Warszawa w X1, X2 i X3, Zielona Góra w X4, Opole w X5 i Katowice w X7. Są to wartości rzeczywiste, a nie błędy danych. Ponieważ wszystkie miasta wojewódzkie muszą znaleźć się w rankingu, żadnej obserwacji nie usunięto. Skutki wartości skrajnych dla obu metod omówiono przy okazji zgodności rankingów i odporności.
+
+# Korelacje
+
+```{r}
+r <- cor(x)
+
+# heatmap
+image(1:7, 1:7, t(r[7:1, ]), col = hcl.colors(20, "Blue-Red 3", rev = TRUE), zlim = c(-1, 1),
+      axes = FALSE, xlab = "", ylab = "", main = "Macierz korelacji Pearsona")
+axis(1, 1:7, colnames(r))
+axis(2, 1:7, rev(colnames(r)), las = 1)
+
+
+for (i in 1:7) for (j in 1:7) text(j, 8 - i, round(r[i, j], 2), cex = 0.8)
+```
+
+Przy n = 18 i poziomie istotności 0,05 korelacja jest statystycznie istotna od |r| = 0,468. Warunek ten spełnia sześć par: X1-X2 (0,83), X2-X3 (0,71), X6-X7 (-0,69), X1-X3 (0,66), X1-X6 (-0,61) i X1-X7 (0,58). Tylko pierwsza przekracza przyjęty próg eliminacji |r| = 0,8. Współczynniki dotyczą danych surowych. Po zamianie destymulant na stymulanty zmienia się znak w parach z jedną destymulantą (X1-X2, X2-X3, X1-X6, X1-X7), a w parze X6-X7, gdzie obie zmienne są destymulantami, pozostaje bez zmian.
+
+Współliniowość oceniono za pomocą przekątnej odwrotności macierzy korelacji. Wartości powyżej 10 wskazują zmienną, którą można wyjaśnić pozostałymi. Największe wartości mają X1 (9,12) i X2 (6,19), dla pozostałych zmiennych nie przekracza 3,71. Żadna wartość nie przekracza 10, więc nie ma podstaw do eliminacji zmiennej z powodu współliniowości.
+
+Korelacja pary X1-X2 (r = 0,83) przekracza umowny próg |r| = 0,8. Mimo to obie zmienne pozostają w analizie. Obie wnoszą odrębną informację - współczynnik determinacji wynosi $R^2$ = 0,69.
+Po zamianie X2 na stymulantę korelacja wynosi -0,83, czyli zmienne działają w przeciwnych kierunkach i częściowo się znoszą: wyższe zarobki są równoważone droższym mieszkaniem. Usunięcie X1 zostawiłoby koszt mieszkania bez przeciwwagi i ranking faworyzowałby miasta tanie, a usunięcie X2 pominęłoby największy wydatek studenta.
+
+Duże, zamożne miasta mają jednocześnie wyższe płace, droższe mieszkania i wyższe wydatki na transport na mieszkańca (X1-X3, X2-X3). Zmienna X3 mierzy nakłady, a nie jakość komunikacji, więc część tej zależności wynika z wielkości budżetów.
+
+Wyższe płace występują tam, gdzie bezrobocie jest niższe (X1-X6). Po odwróceniu X6 korelacja jest dodatnia (0,61), więc oba kryteria wskazują te same miasta i się wzmacniają.
+
+Zmienne X4 i X5 są prawie nieskorelowane z resztą (X4: |r| < 0,25, X5: maksymalnie 0,46, poniżej wartości krytycznej), więc wnoszą niezależne informacje.
+
+
+# Finalna selekcja zmiennych i wektor charakteru
+
+Wszystkie zmienne spełniają odpowiednie kryteria by być ujęte w dalszej analizie.
+
+```{r charakter}
+# S stymulanta, D destymulanta
+charakter <- c("S", "D", "S", "S", "S", "D", "D")
+names(charakter) <- colnames(x)
+print(charakter)
+```
+
+# Normalizacja i metody porządkowania liniowego
+
+Zebrane zmienne diagnostyczne charakteryzują się różnymi jednostkami, dlatego konieczne było sprowadzenie ich do wspólnej skali za pomocą standaryzacji. Aby zachować jednolity kierunek interpretacji (im więcej, tym lepiej), na tym etapie przekształcono destymulanty, mnożąc je przez -1. 
+
+Do oceny miast wykorzystano dwie metody porządkowania liniowego:
+1. Metodę Hellwiga (wzorcową) – opartą na euklidesowej odległości obiektów od abstrakcyjnego "wzorca rozwoju" (wektora maksimów).
+2. Metodę standaryzowanych sum (bezwzorcową) – polegającą na wyznaczeniu miary syntetycznej jako średniej arytmetycznej ze standaryzowanych wartości cech dla danego obiektu.
+
+Podział na cztery klasy atrakcyjności (I - bardzo wysoka, II - wysoka, III - przeciętna, IV - niska) wykonano klasycznie, wykorzystując średnią arytmetyczną i odchylenie standardowe uzyskanej miary syntetycznej.
+
+```{r}
+#hellwig
+m_hellwiga <- function(x, ch) {
+  z <- scale(x)
+  for (j in 1:ncol(z)) if (ch[j] == "D") z[, j] <- -z[, j]
+  wzor <- apply(z, 2, max)
+  d_i0 <- sqrt(rowSums((t(t(z) - wzor))^2))
+  d_0 <- mean(d_i0) + 2 * sd(d_i0)
+  list(miara = 1 - d_i0 / d_0, z = z)
+}
+
+#m. standaryzowanych sum
+m_sum <- function(x, ch) {
+  z <- scale(x)
+  for (j in 1:ncol(z)) if (ch[j] == "D") z[, j] <- -z[, j]
+  list(miara = rowMeans(z), z = z)
+}
+
+#klasy
+klasa <- function(m) {
+  mu <- mean(m)
+  s <- sd(m)
+  ifelse(m >= mu + s, 1, ifelse(m >= mu, 2, ifelse(m >= mu - s, 3, 4)))
+}
+
+h <- m_hellwiga(x, charakter)
+bez <- m_sum(x, charakter)
+
+wyniki <- data.frame(
+  Miasto = rownames(x),
+  hellwig = h$miara,
+  poz_h = rank(-h$miara, ties.method = "min"),
+  klasa_h = klasa(h$miara),
+  sumy = bez$miara,
+  poz_s = rank(-bez$miara, ties.method = "min"),
+  klasa_s = klasa(bez$miara)
+)
+wyniki <- wyniki[order(wyniki$poz_h), ]
+```
+
+```{r}
+knitr::kable(wyniki[, c("Miasto", "hellwig", "poz_h", "klasa_h", "sumy", "poz_s", "klasa_s")], 
+             digits = 3, row.names = FALSE, caption = "Porównanie metod Hellwiga i standaryzowanych sum")
+
+sp <- cor(wyniki$poz_h, wyniki$poz_s, method = "spearman")
+```
+
+Obie metody wykazują bardzo wysoką zgodność (korelacja rang Spearmana wynosi `r round(sp, 3)`). W obu rankingach absolutnym liderem jest Poznań (klasa I), łączący najniższe bezrobocie z wysokimi wydatkami na transport. Z kolei na najniższych pozycjach (klasa IV) niezmiennie plasują się Kielce i Białystok, charakteryzujące się najsłabszym rynkiem pracy i niskimi płacami.
+
+Zauważalne różnice w środku stawki (np. pozycja Katowic) wynikają ze specyfiki miar. Metoda Hellwiga (oparta na odległości euklidesowej) silniej karze miasta za pojedyncze skrajnie słabe wyniki (np. bardzo wysoką przestępczość w Katowicach), podczas gdy metoda standaryzowanych sum pozwala na łatwiejsze zrekompensowanie jednego słabego wyniku dobrymi wynikami w innych kategoriach.
+
+
+# Grupowanie wielowymiarowe
+
+Aby wyodrębnić grupy miast o podobnym profilu, zastosowano analizę skupień. Do wyznaczenia optymalnej liczby klastrów wykorzystano metodę łokcia, opartą na analizie całkowitej sumy kwadratów błędu.
+
+```{r}
+wss <- sapply(1:10, function(k) kmeans(h$z, centers = k, nstart = 25)$tot.withinss)
+plot(1:10, wss, type = "b", pch = 19, frame = FALSE,
+     xlab = "Liczba skupień (k)", ylab = "Całkowita suma kwadratów",
+     main = "Metoda łokcia")
+abline(v = 4, col = "red", lty = 2)
+```
+
+Na powyższym wykresie załamanie (tzw. łokieć) można zaobserwować w okolicach k=3 i k=4. Powyżej 4 skupień wykres ulega wyraźnemu spłaszczeniu. Zdecydowano się zatem na podział na 4 skupienia, co pozwala na łatwiejsze porównanie wyników klastrowania z czterema klasami atrakcyjności wyznaczonymi w porządkowaniu liniowym.
+
+Zastosowano algorytm podziałowy (k-średnich) oraz metodę hierarchiczną (metodę Warda).
+
+```{r}
+set.seed(123)
+km <- kmeans(h$z, centers = 4, nstart = 25)
+hc <- hclust(dist(h$z), method = "ward.D2")
+gh <- cutree(hc, k = 4)
+
+#uporzadkowanie numeracji wg średniej miary Hellwiga
+numeruj <- function(g) {
+  sr <- tapply(h$miara, g, mean)
+  unname(rank(-sr)[as.character(g)])
+}
+
+grupy <- data.frame(Miasto = rownames(x), kmeans = numeruj(km$cluster), ward = numeruj(gh))
+knitr::kable(grupy, row.names = FALSE, caption = "Przynależność miast do klastrów")
+```
+
+```{r}
+library(factoextra)
+
+fviz_dend(hc, 
+          k = 4, 
+          cex = 0.8, 
+          k_colors = c("#3a86d4", "#00AFBB", "#E7B800", "#FC4E07"),
+          color_labels_by_k = TRUE, 
+          rect = TRUE, 
+          rect_border = c("#3a86d4", "#00AFBB", "#E7B800", "#FC4E07"),
+          rect_fill = TRUE,
+          ggtheme = theme_minimal(),
+          main = "Dendrogram miast wojewódzkich (metoda Warda)",
+          xlab = "", 
+          ylab = "Odległość")
+```
+
+```{r}
+library(cluster)
+library(mclust)
+
+#skorygowany indeks Randa (ARI)
+ari_val <- adjustedRandIndex(km$cluster, gh)
+
+#indeks sylwetkowy dla obu metod
+sil_km <- silhouette(km$cluster, dist(h$z))
+sil_ward <- silhouette(gh, dist(h$z))
+
+
+walidacja_tab <- data.frame(
+  Metoda = c("K-średnich", "Metoda Warda"),
+  Średni_Silhouette = c(mean(sil_km[, 3]), mean(sil_ward[, 3]))
+)
+
+knitr::kable(walidacja_tab, digits = 3, 
+             caption = "Średnia wartość wskaźnika Silhouette dla wyodrębnionych grup")
+
+#wykres sylwetkowy dla metody Warda
+fviz_silhouette(sil_ward, print.summary = FALSE) +
+  theme_minimal() +
+  labs(title = "Wykres sylwetkowy dla metody Warda (k = 4)",
+       x = "Miasta", ylab = "szerokość sylwetki)")
+```
+
+Skorygowany indeks Randa (ARI) na poziomie 0,491 świadczy o umiarkowanej zgodności algorytmu k-średnich oraz hierarchicznej metody Warda. Metody te są w pełni spójne w klasyfikacji głównych metropolii i najsłabszych ośrodków, jednak wykazują różnice w przydziale miast brzegowych o specyficznych profilach.
+
+Do ostatecznej interpretacji przyjęto podział uzyskany metodą Warda, na podstawie którego wyodrębniono cztery profile miast:
+
+Skupienie 1 (Warszawa, Kraków, Wrocław, Poznań, Gdańsk): Największe polskie metropolie. Charakteryzują się bardzo dobrym rynkiem pracy, wysokimi zarobkami i dużymi nakładami na transport. Związane jest to jednak z najwyższymi kosztami życia (najdroższe mieszkania)
+
+Skupienie 2 (Zielona Góra, Katowice): Miasta z tej grupy wyróżniają skrajne wartości zmiennych niezwiązanych bezpośrednio z rynkiem mieszkaniowym – bardzo duża liczba imprez masowych, ale i zauważalnie podwyższony wskaźnik przestępczości.
+
+Skupienie 3 (Opole, Rzeszów, Toruń, Gorzów Wlkp., Olsztyn): Miasta przyjazne i bezpieczne. Posiadają bardzo dobrze rozwiniętą infrastrukturę rowerową, niską przestępczość i przystępne ceny mieszkań, jednak oferują niższe płace niż metropolie.
+
+Skupienie 4 (Białystok, Kielce, Lublin, Łódź, Szczecin, Bydgoszcz): Ośrodki o najsłabszej sytuacji na rynku pracy dla absolwentów. Wykazują najwyższe bezrobocie w zestawieniu, niskie płace oraz słabszą infrastrukturę.
+
+Jakość uzyskanego podziału zweryfikowano wskaźnikiem sylwetkowym (Silhouette). Średnia wartość wynosząca 0,221 wskazuje na stosunkowo słabą separację wyodrębnionych grup. Oznacza to, że profile części miast są do siebie podobne, a przypisanie niektórych obiektów do klastrów nie jest jednoznaczne. Dodatnie wartości parametru $s_i$ na wykresie potwierdzają prawidłowe przypisanie miast w klastrach 1, 3 oraz 4 (obiekty te są silniej powiązane ze swoim klastrem niż z sąsiednimi). Wyjątkiem jest skupienie nr 2 (Zielona Góra i Katowice), którego obiekty przyjmują wartości ujemne. Oznacza to, że ze względu na swoje skrajne cechy są to specyficzne miasta pograniczne, które podążają ku innym grupom bardziej niż do swojej.
+
+# Podsumowanie
+
+Przeprowadzona analiza wielowymiarowa pozwala stwierdzić, że atrakcyjność osadnicza z perspektywy studenta wkraczającego na rynek pracy nie jest jednorodna. Wybór optymalnego miejsca do życia wymaga kompromisów.
+
+Rynek pracy vs koszty życia: Zestawienie wyników ukazuje wyraźny związek. Największe miasta (skupienie 1, m.in. Warszawa, Kraków) zapewniają świetny start zawodowy, ale barierą wejścia są bardzo wysokie koszty nieruchomości. Alternatywą są mniejsze miasta wojewódzkie (skupienie 3), które choć oferują mniejsze zarobki, rekompensują to tanią infrastrukturą, bezpieczeństwem i wysokim komfortem codziennego życia.
+
+Zastosowanie dwóch odmiennych technik porządkowania liniowego (metody wzorcowej Hellwiga oraz bezwzorcowej standaryzowanych sum) dało spójne wyniki dla liderów i outsiderów zestawienia, co potwierdza rzetelność wyników.
+
+Poznań uzyskał najwyższą ocenę przy przyjętym zestawie zmiennych. Jest on uniwersalnym ośrodkiem, łącząc zalety wielkich metropolii (najlepszy rynek pracy) z kosztami życia niższymi niż w Warszawie i Krakowie.
